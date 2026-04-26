@@ -151,11 +151,10 @@ def _claude_ai_credentials():
     return cookies
 
 
-def list_chats(limit):
-    cookies = _claude_ai_credentials()
+def _claude_ai_get(path, cookies):
     org = cookies["lastActiveOrg"]
     cookie_header = "; ".join(f"{k}={v}" for k, v in cookies.items())
-    url = f"https://claude.ai/api/organizations/{org}/chat_conversations?limit={limit}"
+    url = f"https://claude.ai/api/organizations/{org}{path}"
     req = Request(url, headers={
         "Cookie": cookie_header,
         "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
@@ -163,8 +162,27 @@ def list_chats(limit):
         "Referer": "https://claude.ai/",
         "Origin": "https://claude.ai",
     })
-    with urlopen(req, timeout=15) as resp:
+    with urlopen(req, timeout=20) as resp:
         return json.loads(resp.read())
+
+
+def list_chats(limit):
+    return _claude_ai_get(f"/chat_conversations?limit={limit}", _claude_ai_credentials())
+
+
+def fetch_chat(uuid, cookies=None):
+    cookies = cookies or _claude_ai_credentials()
+    return _claude_ai_get(
+        f"/chat_conversations/{uuid}?tree=True&rendering_mode=messages&render_all_tools=true",
+        cookies,
+    )
+
+
+def chat_to_records(chat):
+    for m in chat.get("chat_messages", []):
+        role = "user" if m.get("sender") == "human" else "assistant"
+        text = "\n\n".join(c.get("text", "") for c in m.get("content", []) if c.get("type") == "text")
+        yield {"message": {"role": role, "content": text}}
 
 
 def cmd_list(args):
@@ -175,6 +193,39 @@ def cmd_list(args):
 def cmd_chats(args):
     for c in list_chats(args.limit):
         print(c.get("name") or "(untitled)")
+
+
+def cmd_export_chat(args):
+    cookies = _claude_ai_credentials()
+    chats = list_chats(args.limit)
+    if args.all:
+        targets = chats
+    elif args.name:
+        targets = [c for c in chats if (c.get("name") or "") == args.name]
+        if not targets:
+            print(
+                f"No chat named {args.name!r} in the top {args.limit}. "
+                f"Try 'jsonl2md.py chats --limit N' to widen the search.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+    else:
+        print("export-chat: provide a name or --all", file=sys.stderr)
+        sys.exit(2)
+    os.makedirs(args.out, exist_ok=True)
+    for c in targets:
+        chat = fetch_chat(c["uuid"], cookies)
+        md = render_md(chat_to_records(chat))
+        base = safe_name(c.get("name") or c["uuid"])
+        md_path = os.path.join(args.out, base + ".md")
+        with open(md_path, "w") as f:
+            f.write(md)
+        line = md_path
+        if not args.no_pdf:
+            pdf_path = os.path.join(args.out, base + ".pdf")
+            write_pdf(md, pdf_path)
+            line += "  +  " + pdf_path
+        print(line)
 
 
 def cmd_export(args):
@@ -219,6 +270,8 @@ examples:
   jsonl2md.py list --cwd /path/to/other/project       # ... in another project
   jsonl2md.py chats                                   # show top 30 Claude.ai sidebar chats
   jsonl2md.py chats --limit 50                        # ... top 50
+  jsonl2md.py export-chat "Go to Market Strategy"     # export one chat to .md + .pdf
+  jsonl2md.py export-chat --all --limit 10            # export the top 10 chats
   jsonl2md.py export "Professor - done"               # write .md and .pdf to current dir
   jsonl2md.py export "Professor - done" --out ~/Desktop
   jsonl2md.py export "Professor - done" --no-pdf      # skip the PDF, .md only
@@ -268,6 +321,24 @@ def main():
     p_chats.add_argument("--limit", type=int, default=30,
                          help="how many recent chats to fetch (default: 30)")
     p_chats.set_defaults(func=cmd_chats)
+
+    p_xc = sub.add_parser(
+        "export-chat",
+        help="export Claude.ai chat(s) to .md (+ .pdf)",
+        epilog=EPILOG,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    p_xc.add_argument("name", nargs="?",
+                      help="exact chat name (use 'chats' to see them); omit when using --all")
+    p_xc.add_argument("--all", action="store_true",
+                      help="export every chat in the top --limit window")
+    p_xc.add_argument("--limit", type=int, default=30,
+                      help="how many recent chats to consider (default: 30)")
+    p_xc.add_argument("--out", default=".",
+                      help="output directory (default: current dir)")
+    p_xc.add_argument("--no-pdf", action="store_true",
+                      help="write only the .md file, skip PDF generation")
+    p_xc.set_defaults(func=cmd_export_chat)
 
     args = ap.parse_args()
     if not args.cmd:
