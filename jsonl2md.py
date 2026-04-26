@@ -1,11 +1,28 @@
 #!/usr/bin/env python3
-"""Convert Claude Code session JSONL records to a User/Assistant markdown transcript.
+"""jsonl2md - list and export Claude Code sessions as markdown + PDF.
 
-Accepts both strict JSONL (one object per line) and pretty-printed multi-object files.
-Reads from a path argument or stdin; writes markdown to stdout.
+Subcommands:
+  list                   List non-archived, user-titled sessions in the target cwd.
+  export <title>         Export one session to markdown + PDF (filename = title).
+  export --all           Export every session matching the filter.
+  render <path.jsonl>    Render a JSONL file directly to stdout (no metadata lookup).
+
+Sessions are discovered from Claude.app's metadata at
+    ~/Library/Application Support/Claude/claude-code-sessions/<workspace>/<device>/local_*.json
+and the actual transcripts are read from
+    ~/.claude/projects/<cwd-with-slashes-as-dashes>/<cliSessionId>.jsonl
 """
+
+import argparse
+import glob
 import json
+import os
+import re
 import sys
+
+DEFAULT_CWD = "/Users/derekbredensteiner/Documents/PlatformIO/Projects/soda-flavor-injector"
+META_ROOT = os.path.expanduser("~/Library/Application Support/Claude/claude-code-sessions")
+JSONL_ROOT = os.path.expanduser("~/.claude/projects")
 
 
 def iter_records(text):
@@ -21,7 +38,7 @@ def iter_records(text):
         i = end
 
 
-def extract(obj):
+def extract_message(obj):
     msg = obj.get("message") or {}
     role = msg.get("role") or obj.get("type")
     content = msg.get("content")
@@ -34,10 +51,10 @@ def extract(obj):
     return role, text.strip()
 
 
-def render(records):
+def render_md(records):
     blocks = []
     for obj in records:
-        role, text = extract(obj)
+        role, text = extract_message(obj)
         if role not in ("user", "assistant") or not text:
             continue
         label = "User" if role == "user" else "Assistant"
@@ -45,9 +62,119 @@ def render(records):
     return "\n".join(blocks)
 
 
+def list_sessions(target_cwd):
+    out = []
+    for p in glob.glob(f"{META_ROOT}/*/*/local_*.json"):
+        try:
+            m = json.load(open(p))
+        except Exception:
+            continue
+        if m.get("cwd") != target_cwd:
+            continue
+        if m.get("isArchived"):
+            continue
+        if m.get("titleSource") != "user":
+            continue
+        out.append(m)
+    out.sort(key=lambda m: m.get("lastActivityAt", 0), reverse=True)
+    return out
+
+
+def jsonl_path_for(cli_session_id, cwd):
+    return os.path.join(JSONL_ROOT, cwd.replace("/", "-"), f"{cli_session_id}.jsonl")
+
+
+def safe_name(name):
+    return re.sub(r"[/\\:]+", "_", name).strip()
+
+
+PDF_CSS = """
+@page { margin: 0.8in; size: letter; }
+body { font-family: -apple-system, BlinkMacSystemFont, sans-serif; font-size: 10.5pt; line-height: 1.45; }
+h1 { font-size: 13pt; margin: 0.6em 0; }
+h2 { font-size: 12pt; }
+h3 { font-size: 11pt; }
+hr { border: none; border-top: 1px solid #999; margin: 0.6em 0; }
+code { font-family: SFMono-Regular, Menlo, monospace; font-size: 9.5pt; background: #f4f4f4; padding: 1px 4px; border-radius: 3px; }
+pre { background: #f4f4f4; padding: 8px; border-radius: 4px; }
+pre code { background: none; padding: 0; }
+blockquote { border-left: 3px solid #bbb; margin-left: 0; padding-left: 12px; color: #555; }
+table { border-collapse: collapse; }
+td, th { border: 1px solid #ccc; padding: 4px 8px; }
+"""
+
+
+def write_pdf(md_text, out_path):
+    import markdown as md_lib
+    from weasyprint import HTML
+    html_body = md_lib.markdown(md_text, extensions=["fenced_code", "tables"])
+    html = f"<html><head><meta charset='utf-8'><style>{PDF_CSS}</style></head><body>{html_body}</body></html>"
+    HTML(string=html).write_pdf(out_path)
+
+
+def cmd_list(args):
+    for s in list_sessions(args.cwd):
+        print(s["title"])
+
+
+def cmd_export(args):
+    sessions = list_sessions(args.cwd)
+    if args.all:
+        targets = sessions
+    elif args.title:
+        targets = [s for s in sessions if s["title"] == args.title]
+        if not targets:
+            print(f"No non-archived user-titled session named {args.title!r} in {args.cwd}", file=sys.stderr)
+            sys.exit(1)
+    else:
+        print("export: provide a title or --all", file=sys.stderr)
+        sys.exit(2)
+    os.makedirs(args.out, exist_ok=True)
+    for s in targets:
+        jsonl = jsonl_path_for(s["cliSessionId"], s["cwd"])
+        if not os.path.exists(jsonl):
+            print(f"missing transcript: {jsonl}", file=sys.stderr)
+            continue
+        md = render_md(iter_records(open(jsonl).read()))
+        base = safe_name(s["title"])
+        md_path = os.path.join(args.out, base + ".md")
+        with open(md_path, "w") as f:
+            f.write(md)
+        line = md_path
+        if not args.no_pdf:
+            pdf_path = os.path.join(args.out, base + ".pdf")
+            write_pdf(md, pdf_path)
+            line += "  +  " + pdf_path
+        print(line)
+
+
+def cmd_render(args):
+    text = open(args.path).read() if args.path else sys.stdin.read()
+    sys.stdout.write(render_md(iter_records(text)))
+
+
 def main():
-    src = open(sys.argv[1]).read() if len(sys.argv) > 1 else sys.stdin.read()
-    sys.stdout.write(render(iter_records(src)))
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = ap.add_subparsers(dest="cmd", required=True)
+
+    p_list = sub.add_parser("list", help="list sessions")
+    p_list.add_argument("--cwd", default=DEFAULT_CWD)
+    p_list.set_defaults(func=cmd_list)
+
+    p_exp = sub.add_parser("export", help="export session(s) to .md (+ .pdf)")
+    p_exp.add_argument("title", nargs="?")
+    p_exp.add_argument("--all", action="store_true")
+    p_exp.add_argument("--cwd", default=DEFAULT_CWD)
+    p_exp.add_argument("--out", default=".")
+    p_exp.add_argument("--no-pdf", action="store_true")
+    p_exp.set_defaults(func=cmd_export)
+
+    p_ren = sub.add_parser("render", help="render a JSONL file or stdin")
+    p_ren.add_argument("path", nargs="?")
+    p_ren.set_defaults(func=cmd_render)
+
+    args = ap.parse_args()
+    args.func(args)
 
 
 if __name__ == "__main__":
