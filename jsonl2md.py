@@ -153,27 +153,59 @@ def cmd_render(args):
     sys.stdout.write(render_md(iter_records(text)))
 
 
-def main():
-    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    sub = ap.add_subparsers(dest="cmd", required=True)
+EPILOG = """\
+examples:
+  jsonl2md.py list                                    # show titles in default project
+  jsonl2md.py list --cwd /path/to/other/project       # show titles in another project
+  jsonl2md.py export "Professor - done"               # write .md and .pdf to current dir
+  jsonl2md.py export "Professor - done" --out ~/Desktop
+  jsonl2md.py export "Professor - done" --no-pdf      # skip the PDF, .md only
+  jsonl2md.py export --all --out ./exports            # export every visible session
+  jsonl2md.py render path/to/session.jsonl > out.md   # raw render, no metadata lookup
+  cat session.jsonl | jsonl2md.py render > out.md
+"""
 
-    p_list = sub.add_parser("list", help="list sessions")
-    p_list.add_argument("--cwd", default=DEFAULT_CWD)
+
+def main():
+    ap = argparse.ArgumentParser(
+        description=__doc__,
+        epilog=EPILOG,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    sub = ap.add_subparsers(dest="cmd", metavar="{list,export,render}")
+
+    p_list = sub.add_parser("list", help="list non-archived, user-titled sessions")
+    p_list.add_argument("--cwd", default=DEFAULT_CWD,
+                        help=f"project path to filter by (default: {DEFAULT_CWD})")
     p_list.set_defaults(func=cmd_list)
 
-    p_exp = sub.add_parser("export", help="export session(s) to .md (+ .pdf)")
-    p_exp.add_argument("title", nargs="?")
-    p_exp.add_argument("--all", action="store_true")
-    p_exp.add_argument("--cwd", default=DEFAULT_CWD)
-    p_exp.add_argument("--out", default=".")
-    p_exp.add_argument("--no-pdf", action="store_true")
+    p_exp = sub.add_parser(
+        "export",
+        help="export session(s) to .md (+ .pdf)",
+        epilog=EPILOG,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    p_exp.add_argument("title", nargs="?",
+                       help="exact session title (use 'list' to see them); omit when using --all")
+    p_exp.add_argument("--all", action="store_true",
+                       help="export every visible session in the target cwd")
+    p_exp.add_argument("--cwd", default=DEFAULT_CWD,
+                       help=f"project path to filter by (default: {DEFAULT_CWD})")
+    p_exp.add_argument("--out", default=".",
+                       help="output directory (default: current dir)")
+    p_exp.add_argument("--no-pdf", action="store_true",
+                       help="write only the .md file, skip PDF generation")
     p_exp.set_defaults(func=cmd_export)
 
-    p_ren = sub.add_parser("render", help="render a JSONL file or stdin")
-    p_ren.add_argument("path", nargs="?")
+    p_ren = sub.add_parser("render", help="render a JSONL file or stdin to markdown on stdout")
+    p_ren.add_argument("path", nargs="?",
+                       help="path to a .jsonl file (omit to read from stdin)")
     p_ren.set_defaults(func=cmd_render)
 
     args = ap.parse_args()
+    if not args.cmd:
+        ap.print_help()
+        return
     args.func(args)
 
 
