@@ -15,7 +15,7 @@ pip install -r requirements.txt
 ## Usage
 
 ```sh
-# What sessions are visible (non-archived, user-titled) for the default project?
+# What Claude Code sessions are visible (non-archived, user-titled) for the default project?
 ./jsonl2md.py list
 
 # Export one by title — produces .md and .pdf side by side.
@@ -27,9 +27,17 @@ pip install -r requirements.txt
 # Different project.
 ./jsonl2md.py list --cwd /Users/me/some-other-project
 
+# List your main Claude.ai sidebar chats (top 30 by default; raise with --limit).
+./jsonl2md.py chats
+./jsonl2md.py chats --limit 50
+
 # Bypass the metadata lookup — render any JSONL file (or stdin) to stdout.
 ./jsonl2md.py render path/to/session.jsonl > transcript.md
 ```
+
+### `chats` and the keychain
+
+`chats` reads encrypted Claude.app cookies from `~/Library/Application Support/Claude/Cookies` and decrypts them with the AES key stored in your macOS Keychain under "Claude Safe Storage / Claude Key". The first time you run it, the OS will prompt you to allow keychain access — pick "Always Allow" if you want it to be silent thereafter.
 
 The default `--cwd` is hardcoded to `soda-flavor-injector` (the project this tool was built for); override with `--cwd` for anything else.
 
