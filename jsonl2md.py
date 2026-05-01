@@ -24,7 +24,7 @@ import subprocess
 import sys
 from urllib.request import Request, urlopen
 
-DEFAULT_CWD = "/Users/derekbredensteiner/Documents/PlatformIO/Projects/soda-flavor-injector"
+DEFAULT_CWD = "/Users/derekbredensteiner/Developer/homesodamachine"
 META_ROOT = os.path.expanduser("~/Library/Application Support/Claude/claude-code-sessions")
 JSONL_ROOT = os.path.expanduser("~/.claude/projects")
 CLAUDE_APP_DIR = os.path.expanduser("~/Library/Application Support/Claude")
