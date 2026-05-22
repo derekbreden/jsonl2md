@@ -128,26 +128,56 @@ def cmd_render(args):
     sys.stdout.write(render_md(iter_records(text)))
 
 
-def main():
-    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    sub = ap.add_subparsers(dest="cmd", required=True)
+EPILOG = """\
+examples:
+  jsonl2md.py list-sessions                              # show titles in default project
+  jsonl2md.py list-sessions --cwd /path/to/other/project # show titles in another project
+  jsonl2md.py export-session "Professor - done"          # write .md to current dir
+  jsonl2md.py export-session "Professor - done" --out ~/Desktop
+  jsonl2md.py export-session --all --out ./exports       # export every visible session
+  jsonl2md.py render path/to/session.jsonl > out.md      # raw render, no metadata lookup
+  cat session.jsonl | jsonl2md.py render > out.md
+"""
 
-    p_ls = sub.add_parser("list-sessions", help="list sessions")
-    p_ls.add_argument("--cwd", default=DEFAULT_CWD)
+
+def main():
+    ap = argparse.ArgumentParser(
+        description=__doc__,
+        epilog=EPILOG,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    sub = ap.add_subparsers(dest="cmd", metavar="{list-sessions,export-session,render}")
+
+    p_ls = sub.add_parser("list-sessions", help="list non-archived, user-titled sessions")
+    p_ls.add_argument("--cwd", default=DEFAULT_CWD,
+                     help=f"project path to filter by (default: {DEFAULT_CWD})")
     p_ls.set_defaults(func=cmd_list_sessions)
 
-    p_es = sub.add_parser("export-session", help="export session(s) to .md")
-    p_es.add_argument("title", nargs="?")
-    p_es.add_argument("--all", action="store_true")
-    p_es.add_argument("--cwd", default=DEFAULT_CWD)
-    p_es.add_argument("--out", default=".")
+    p_es = sub.add_parser(
+        "export-session",
+        help="export session(s) to .md",
+        epilog=EPILOG,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    p_es.add_argument("title", nargs="?",
+                     help="exact session title (use 'list-sessions' to see them); omit when using --all")
+    p_es.add_argument("--all", action="store_true",
+                     help="export every visible session in the target cwd")
+    p_es.add_argument("--cwd", default=DEFAULT_CWD,
+                     help=f"project path to filter by (default: {DEFAULT_CWD})")
+    p_es.add_argument("--out", default=".",
+                     help="output directory (default: current dir)")
     p_es.set_defaults(func=cmd_export_session)
 
-    p_ren = sub.add_parser("render", help="render a JSONL file or stdin")
-    p_ren.add_argument("path", nargs="?")
+    p_ren = sub.add_parser("render", help="render a JSONL file or stdin to markdown on stdout")
+    p_ren.add_argument("path", nargs="?",
+                      help="path to a .jsonl file (omit to read from stdin)")
     p_ren.set_defaults(func=cmd_render)
 
     args = ap.parse_args()
+    if not args.cmd:
+        ap.print_help()
+        return
     args.func(args)
 
 
