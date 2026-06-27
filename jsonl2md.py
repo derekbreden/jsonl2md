@@ -32,6 +32,7 @@ import re
 import sqlite3
 import subprocess
 import sys
+import time
 from urllib.request import Request, urlopen
 
 DEFAULT_CWD = "/Users/derekbredensteiner/Developer/homesodamachine"
@@ -78,6 +79,123 @@ def render_md(records):
         label = "User" if role == "user" else "Assistant"
         blocks.append(f"---\n\n# {label}\n\n---\n\n{text}\n")
     return "\n".join(blocks)
+
+
+# --- delta / watch: share only what's new since you last shared ---------------
+#
+# The cursor anchors on the uuid of the last RECORD seen (any record), not the
+# last rendered turn, because ~70% of transcript records are tool_use/thinking/
+# tool_result plumbing with no text; anchoring on a rendered turn would desync
+# the moment a tool call lands between two turns. The cursor only advances on an
+# explicit --commit, so it tracks what you actually relayed, not what you merely
+# previewed — the human, not the bookmark, stays the switchboard.
+
+CURSOR_ROOT = os.path.expanduser("~/.jsonl2md/cursors")
+FIRST_SHARE_WARN = 40  # records; above this, a cursorless delta needs --first-share
+UUID_RE = re.compile(r"^[0-9a-fA-F-]{8,}$")
+
+
+def iter_records_safe(text):
+    """Like iter_records, but stop cleanly at a half-written trailing record
+    instead of raising — safe to read a transcript being appended to live (its
+    final line is often a partially-flushed JSON object)."""
+    decoder = json.JSONDecoder()
+    i, n = 0, len(text)
+    while i < n:
+        while i < n and text[i].isspace():
+            i += 1
+        if i >= n:
+            break
+        try:
+            obj, end = decoder.raw_decode(text, i)
+        except ValueError:
+            break  # trailing partial record not yet committed; stop here
+        yield obj
+        i = end
+
+
+def last_uuid(records):
+    """uuid of the last record that carries one — the cursor anchor."""
+    u = None
+    for obj in records:
+        if obj.get("uuid"):
+            u = obj["uuid"]
+    return u
+
+
+def split_after_cursor(records, cursor_uuid):
+    """Return (tail, found). tail = records strictly after the one whose
+    uuid == cursor_uuid. If cursor_uuid is None or absent (compaction / fork /
+    /clear minted a new sessionId), found is False and tail is the whole list."""
+    records = list(records)
+    if cursor_uuid is None:
+        return records, False
+    for idx, obj in enumerate(records):
+        if obj.get("uuid") == cursor_uuid:
+            return records[idx + 1:], True
+    return records, False
+
+
+def render_tail(records, k):
+    """Render only the last k user+assistant exchanges (2k text turns). Slices
+    the list of turns, not the rendered string, so a turn whose own text
+    contains the '# User' delimiter can't split wrong."""
+    turns = [(r, t) for r, t in (extract_message(o) for o in records)
+             if r in ("user", "assistant") and t]
+    if k and k > 0:
+        turns = turns[-2 * k:]
+    blocks = [f"---\n\n# {'User' if r == 'user' else 'Assistant'}\n\n---\n\n{t}\n"
+              for r, t in turns]
+    return "\n".join(blocks)
+
+
+def cursor_path(cli_id):
+    return os.path.join(CURSOR_ROOT, f"{cli_id}.json")
+
+
+def read_cursor(cli_id):
+    try:
+        with open(cursor_path(cli_id)) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return None
+
+
+def write_cursor(cli_id, uuid, count):
+    os.makedirs(CURSOR_ROOT, exist_ok=True)
+    tmp = cursor_path(cli_id) + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump({"uuid": uuid, "count": count}, f)
+    os.replace(tmp, cursor_path(cli_id))
+
+
+def clear_cursor(cli_id):
+    try:
+        os.remove(cursor_path(cli_id))
+    except OSError:
+        pass
+
+
+def resolve_target(positional, cwd):
+    """Map a positional (exact user title OR a raw cliSessionId) to
+    (cli_session_id, label). Title resolution is restricted to user-titled,
+    non-archived sessions, exactly like list-sessions; a raw cliSessionId
+    bypasses that filter so untitled/archived sessions stay reachable. Fails
+    loud on an ambiguous title rather than silently relaying the wrong thread."""
+    sessions = list_sessions(cwd)
+    by_title = [s for s in sessions if s.get("title") == positional and s.get("cliSessionId")]
+    if len(by_title) == 1:
+        return by_title[0]["cliSessionId"], by_title[0].get("title")
+    if len(by_title) > 1:
+        sys.stderr.write(f"Ambiguous title {positional!r} ({len(by_title)} matches). Pass a cliSessionId:\n")
+        for s in by_title:
+            sys.stderr.write(f"  {s['cliSessionId']}  lastActivityAt={s.get('lastActivityAt')}\n")
+        sys.exit(1)
+    if UUID_RE.match(positional) and os.path.exists(jsonl_path_for(positional, cwd)):
+        return positional, positional
+    sys.stderr.write(f"No user-titled session {positional!r} in {cwd}, and not a known cliSessionId.\n")
+    sys.stderr.write("Run 'jsonl2md.py list-sessions' to see titles, or pass a cliSessionId.\n")
+    sys.exit(1)
 
 
 def list_sessions(target_cwd):
@@ -244,6 +362,94 @@ def cmd_render(args):
     sys.stdout.write(render_md(iter_records(text)))
 
 
+def cmd_delta(args):
+    cli_id, label = resolve_target(args.title, args.cwd)
+    jsonl = jsonl_path_for(cli_id, args.cwd)
+    if not os.path.exists(jsonl):
+        sys.stderr.write(f"missing transcript: {jsonl}\n")
+        sys.exit(1)
+    records = list(iter_records_safe(open(jsonl).read()))
+    total = len(records)
+    file_last = last_uuid(records)
+
+    if args.reset:
+        clear_cursor(cli_id)
+
+    if args.tail is not None:
+        md = render_tail(records, args.tail)
+        sys.stdout.write(md + ("\n" if md and not md.endswith("\n") else ""))
+        sys.stderr.write(f"[tail {args.tail}] {label} — cursor untouched ({cli_id})\n")
+        return
+
+    cur = None if args.reset else read_cursor(cli_id)
+    cursor_uuid = cur.get("uuid") if cur else None
+    tail, found = split_after_cursor(records, cursor_uuid)
+
+    if cursor_uuid is None and not args.reset and total > FIRST_SHARE_WARN and not args.first_share:
+        sys.stderr.write(
+            f"No cursor for {label} ({cli_id}); a delta now would emit the ENTIRE "
+            f"{total}-record transcript.\n"
+            f"  --first-share  emit it all and set this as the baseline\n"
+            f"  --tail K       just grab the last K exchanges instead\n")
+        sys.exit(2)
+    if cursor_uuid is not None and not found:
+        sys.stderr.write(
+            f"Cursor {cursor_uuid} not in {label} (compaction / fork / clear?); "
+            f"emitting the whole transcript. Re-run with --reset to rebaseline.\n")
+
+    md = render_md(tail)
+    if md.strip():
+        sys.stdout.write(md + ("\n" if not md.endswith("\n") else ""))
+    else:
+        sys.stderr.write(f"(no new user/assistant turns since last share; cursor at {cursor_uuid})\n")
+
+    if args.commit:
+        write_cursor(cli_id, file_last, total)
+        sys.stderr.write(f"[committed] {label} cursor -> {file_last} ({total} records)\n")
+    else:
+        sys.stderr.write(
+            f"[preview] {label} not marked shared. To mark these as relayed: "
+            f"jsonl2md.py delta {args.title!r} --commit\n")
+
+
+def cmd_watch(args):
+    cli_id, label = resolve_target(args.title, args.cwd)
+    jsonl = jsonl_path_for(cli_id, args.cwd)
+    if not os.path.exists(jsonl):
+        sys.stderr.write(f"missing transcript: {jsonl}\n")
+        sys.exit(1)
+
+    cur = read_cursor(cli_id)
+    cursor_uuid = cur.get("uuid") if cur else None
+    if cursor_uuid is None:
+        cursor_uuid = last_uuid(list(iter_records_safe(open(jsonl).read())))
+        sys.stderr.write(f"[watch] {label}: no cursor; streaming only NEW turns from now. Ctrl-C to stop.\n")
+    else:
+        sys.stderr.write(f"[watch] {label}: resuming from saved cursor. Ctrl-C to stop.\n")
+
+    last_size = -1
+    try:
+        while True:
+            try:
+                size = os.path.getsize(jsonl)
+            except OSError:
+                size = -1
+            if size != last_size:
+                last_size = size
+                records = list(iter_records_safe(open(jsonl).read()))
+                file_last = last_uuid(records)
+                tail, found = split_after_cursor(records, cursor_uuid)
+                if found and tail:
+                    md = render_md(tail)
+                    if md.strip():
+                        sys.stdout.write(md + ("\n" if not md.endswith("\n") else ""))
+                        sys.stdout.flush()
+                cursor_uuid = file_last  # advance in-memory only; watch never writes the cursor
+            time.sleep(args.interval)
+    except KeyboardInterrupt:
+        sys.stderr.write(f"\n[watch] {label}: stopped (cursor not committed).\n")
+
+
 EPILOG = """\
 examples:
   # Claude Code sessions (current project on disk)
@@ -259,6 +465,12 @@ examples:
   jsonl2md.py export-chat "Go to Market Strategy"
   jsonl2md.py export-chat --all --limit 10 --out ./chat-exports
 
+  # Share only what's new since you last shared (the Salon delta flow)
+  jsonl2md.py delta "PCB clean"            # preview new turns; cursor untouched
+  jsonl2md.py delta "PCB clean" --commit   # same, and mark them shared
+  jsonl2md.py delta "PCB clean" --tail 2   # just the last 2 exchanges
+  jsonl2md.py watch "PCB clean"            # stream new turns live as they land
+
   # Standalone: any Claude Code .jsonl on disk
   jsonl2md.py render path/to/session.jsonl > out.md
   cat session.jsonl | jsonl2md.py render > out.md
@@ -273,7 +485,7 @@ def main():
     )
     sub = ap.add_subparsers(
         dest="cmd",
-        metavar="{list-sessions,export-session,list-chats,export-chat,render}",
+        metavar="{list-sessions,export-session,list-chats,export-chat,render,delta,watch}",
     )
 
     p_ls = sub.add_parser("list-sessions", help="list non-archived, user-titled Claude Code sessions")
@@ -322,6 +534,30 @@ def main():
     p_ren.add_argument("path", nargs="?",
                       help="path to a .jsonl file (omit to read from stdin)")
     p_ren.set_defaults(func=cmd_render)
+
+    p_delta = sub.add_parser(
+        "delta",
+        help="emit only the user/assistant turns added since you last shared",
+        epilog=EPILOG,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    p_delta.add_argument("title", help="exact session title (see list-sessions) or a cliSessionId")
+    p_delta.add_argument("--cwd", default=DEFAULT_CWD, help=f"project path (default: {DEFAULT_CWD})")
+    p_delta.add_argument("--commit", action="store_true",
+                        help="advance the saved cursor to the file tail (mark these turns as shared)")
+    p_delta.add_argument("--tail", type=int, metavar="K",
+                        help="ignore the cursor; emit only the last K exchanges (cursor untouched)")
+    p_delta.add_argument("--reset", action="store_true",
+                        help="delete the saved cursor and share from the start")
+    p_delta.add_argument("--first-share", action="store_true",
+                        help="confirm emitting a whole transcript when no cursor exists yet")
+    p_delta.set_defaults(func=cmd_delta)
+
+    p_watch = sub.add_parser("watch", help="stream new user/assistant turns as the session grows")
+    p_watch.add_argument("title", help="exact session title (see list-sessions) or a cliSessionId")
+    p_watch.add_argument("--cwd", default=DEFAULT_CWD, help=f"project path (default: {DEFAULT_CWD})")
+    p_watch.add_argument("--interval", type=float, default=1.0, help="poll seconds (default: 1.0)")
+    p_watch.set_defaults(func=cmd_watch)
 
     args = ap.parse_args()
     if not args.cmd:

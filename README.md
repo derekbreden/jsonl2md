@@ -38,6 +38,23 @@ Plus `render <path.jsonl>` — standalone, render any Claude Code transcript fil
 
 Run `./jsonl2md.py` with no arguments to see the full help and example commands.
 
+### Sharing only what's new: `delta` and `watch`
+
+`export-session` always dumps the whole conversation. When you're relaying one session into another and only want *what changed since you last shared*, use `delta`:
+
+| Command | Effect |
+| --- | --- |
+| `delta "<title>"` | print the user/assistant turns added since the last `--commit` — a **preview** that does *not* advance the cursor |
+| `delta "<title>" --commit` | same, and mark those turns as shared (advance the cursor) |
+| `delta "<title>" --tail K` | ignore the cursor; print just the last K exchanges |
+| `delta "<title>" --reset` | forget the cursor and share from the start |
+| `delta "<title>" --first-share` | confirm emitting a whole transcript when no cursor exists yet |
+| `watch "<title>"` | stream new turns to your terminal as the session grows (Ctrl-C to stop) |
+
+The positional accepts an exact session title **or** a raw `cliSessionId`, so untitled/archived sessions stay reachable. The cursor lives per session at `~/.jsonl2md/cursors/<cliSessionId>.json` and anchors on the last transcript *record* seen — not the last rendered turn — so the ~70% of records that are tool/thinking plumbing between two turns never desync the delta. The cursor advances **only** on `--commit`, so it always reflects what you actually relayed, never what you merely previewed.
+
+See [SALON.md](SALON.md) for the human-mediated session-to-session relay workflow these commands are built for.
+
 ## Install
 
 ```sh
@@ -61,6 +78,12 @@ That installs `cryptography` (used to decrypt Claude.app's cookie store on macOS
 ./jsonl2md.py list-chats --limit 50
 ./jsonl2md.py export-chat "Go to Market Strategy"
 ./jsonl2md.py export-chat --all --limit 10 --out ./chat-exports
+
+# Share only what's new since you last shared
+./jsonl2md.py delta "Professor - done"            # preview new turns; cursor untouched
+./jsonl2md.py delta "Professor - done" --commit   # same, and mark them shared
+./jsonl2md.py delta "Professor - done" --tail 2   # just the last 2 exchanges
+./jsonl2md.py watch "Professor - done"            # stream new turns live as they land
 
 # Standalone: any Claude Code .jsonl file
 ./jsonl2md.py render path/to/session.jsonl > out.md
